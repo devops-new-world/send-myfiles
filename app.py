@@ -5,9 +5,14 @@ from flask import Flask, request, jsonify
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from email.message import EmailMessage
 import json
 import logging
 from logging.handlers import RotatingFileHandler
+
+import logging
+import subprocess
+
 
 app = Flask(__name__)
 
@@ -19,6 +24,17 @@ MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB
 # Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+def get_public_ip():
+    try:
+        # Use curl to fetch the public IP
+        result = subprocess.run(['curl', '-4', 'ifconfig.me'], stdout=subprocess.PIPE)
+        public_ip = result.stdout.decode('utf-8').strip()  # Get the IP from the output
+        return public_ip
+    except Exception as e:
+        logger.error(f"Error getting public IP: {e}")
+        return None
+
 
 def load_secrets():
     try:
@@ -32,33 +48,34 @@ def load_secrets():
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
-def send_email(recipient_email, file_url):
-    secrets = load_secrets()
-    if not secrets:
-        logger.error("Could not load email credentials")
-        return False
 
-    sender_email = secrets['smtp_username']
-    password = secrets['smtp_password']
+logger = logging.getLogger(__name__)
 
-    msg = MIMEMultipart()
-    msg['From'] = sender_email
-    msg['To'] = recipient_email
-    msg['Subject'] = "Your File Upload Link"
-
-    body = f"Your file has been uploaded successfully. You can download it from: {file_url}"
-    msg.attach(MIMEText(body, 'plain'))
-
+def send_email(sender_email, password, recipient_email, file_url):
     try:
+        # Prepare the email body
+        body = f"Your file has been uploaded successfully. You can download it from: {file_url}"
+        body = body.replace(u'\xa0', u' ')  # Replace non-breaking spaces with normal spaces
+
+        # Create MIMEText directly (no need for MIMEMultipart)
+        msg = MIMEText(body, 'plain', 'utf-8')
+        msg['From'] = sender_email
+        msg['To'] = recipient_email
+        msg['Subject'] = "Your File Upload Link"
+
+        # SMTP sending
         server = smtplib.SMTP('smtp.gmail.com', 587)
         server.starttls()
         server.login(sender_email, password)
         server.send_message(msg)
         server.quit()
+
+        logger.info("Email sent successfully")
         return True
     except Exception as e:
         logger.error(f"Error sending email: {e}")
         return False
+
 
 def cleanup_old_files():
     try:
@@ -79,9 +96,9 @@ def upload_file():
         return jsonify({'error': 'No file part'}), 400
     
     file = request.files['file']
-    email = request.form.get('email')
+    recipient_email = request.form.get('email')  # rename for clarity
     
-    if not email:
+    if not recipient_email:
         return jsonify({'error': 'No email provided'}), 400
     
     if file.filename == '':
@@ -91,16 +108,35 @@ def upload_file():
         return jsonify({'error': 'File type not allowed'}), 400
     
     try:
+        # Load secrets
+        secrets = load_secrets()
+        if not secrets:
+            return jsonify({'error': 'Failed to load secrets'}), 500
+
+        sender_email = secrets.get('smtp_username')
+        password = secrets.get('smtp_password', '').replace(u'\xa0', u' ').strip()
+
+        # Add this:
+        if not sender_email or not password:
+            logger.error(f"Secrets file missing 'email' or 'password'. Loaded secrets: {secrets}")
+            return jsonify({'error': 'Email/password not found in secrets'}), 500
+
+
         # Save the file
         filename = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{file.filename}"
         filepath = os.path.join(UPLOAD_FOLDER, filename)
         file.save(filepath)
         
-        # Generate download URL
-        file_url = f"ftp://your-server-address/{filename}"
+        # Generate download URL with the actual public IP
+        public_ip = get_public_ip()
+        if public_ip:
+            file_url = f"ftp://{public_ip}/{filename}"
+        else:
+            file_url = f"ftp://your-server-address/{filename}"  # Fallback to internal IP
+
         
         # Send email
-        if send_email(email, file_url):
+        if send_email(sender_email, password, recipient_email, file_url):
             return jsonify({
                 'message': 'File uploaded successfully',
                 'download_url': file_url
@@ -123,4 +159,4 @@ if __name__ == '__main__':
     cleanup_old_files()
     
     # Start the Flask app
-    app.run(host='0.0.0.0', port=5000) 
+    app.run(host='0.0.0.0', port=5000)
